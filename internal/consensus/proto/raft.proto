@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package raft;
+
+// 生成 Go 代码时的包名
+option go_package = "./pb";
+
+// Raft 内部核心通讯
+service RaftInternal {
+  // 1. 选主请求：Candidate 发起拉票
+  rpc RequestVote (RequestVoteArgs) returns (RequestVoteReply);
+
+  // 2. 日志同步/心跳：Leader 向其他节点同步日志或维持心跳
+  rpc AppendEntries (AppendEntriesArgs) returns (AppendEntriesReply);
+
+  // 3. (可选/进阶) 安装快照：当某个节点落后太多时，Leader 直接发快照文件
+  rpc InstallSnapshot (InstallSnapshotArgs) returns (InstallSnapshotReply);
+}
+
+// 投票相关
+message RequestVoteArgs {
+  int64 term = 1;          // 候选人的当前任期
+  string candidate_id = 2;  // 候选人ID
+  int64 last_log_index = 3; // 候选人最后一条日志的索引
+  int64 last_log_term = 4;  // 候选人最后一条日志的任期
+}
+
+message RequestVoteReply {
+  int64 term = 1;          // 接收方当前任期，供候选人更新自己
+  bool vote_granted = 2;   // 是否投赞成票
+  string peer_id = 3;
+}
+
+// 日志同步相关
+message LogEntry {
+  int64 index = 1;         // 日志索引
+  int64 term = 2;          // 该日志所属任期
+  bytes data = 3;          // 具体的指令数据（如 Set K V）
+}
+
+message AppendEntriesArgs {
+  int64 term = 1;          // Leader 现在的任期
+  string leader_id = 2;     // Leader ID
+  int64 prev_log_index = 3; // 紧邻新日志前的索引（对账用）
+  int64 prev_log_term = 4;  // 紧邻新日志前的任期（对账用）
+  int64 leader_commit = 5;  // Leader 已提交的索引位置
+  repeated LogEntry entries = 6; // 要存储的日志条目（心跳时为空）
+}
+
+message AppendEntriesReply {
+  int64 term = 1;          // 接收方当前任期，供 Leader 更新自己
+  bool success = 2;        // 对账是否成功
+  int64 conflict_index = 3; // (优化项) 冲突的索引位置，用于快速回溯
+  int64 conflict_term = 4;  // (优化项) 冲突的任期
+}
+
+// 快照相关 (占位)
+message InstallSnapshotArgs {
+  int64 term = 1;
+  string leader_id = 2;
+  int64 last_included_index = 3;
+  int64 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotReply {
+  int64 term = 1;
+}
+
+// protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative raft.proto
