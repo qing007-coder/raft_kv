@@ -42,8 +42,9 @@ type Raft struct {
 	votesReceived     map[string]bool
 	// --- Leader 独有状态 ---
 	// 工业级实现中，建议用 map[string]int64 对应 nodeID
-	nextIndex  map[string]int64
-	matchIndex map[string]int64
+	messageChan map[string]chan struct{}
+	nextIndex   map[string]int64
+	matchIndex  map[string]int64
 }
 
 func NewRaft() *Raft {
@@ -52,6 +53,7 @@ func NewRaft() *Raft {
 	raft.nodeID = conf.NodeID
 	peers := conf.Peers
 	raft.peers = conf.Peers
+	raft.messageChan = make(map[string]chan struct{}, 1)
 	for _, peer := range peers {
 		conn, err := grpc.NewClient(peer.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
@@ -61,6 +63,7 @@ func NewRaft() *Raft {
 
 		client := pb.NewRaftInternalClient(conn)
 		raft.peersConn = append(raft.peersConn, client)
+		raft.messageChan[peer.ID] = make(chan struct{}, 1)
 	}
 
 	raft.ctx = context.Background()
@@ -122,7 +125,7 @@ func (raft *Raft) startElection() {
 	raft.mu.Unlock()
 
 	for _, client := range raft.peersConn {
-		go raft.SendRequestVote(client, nodeID, term, lastLogIndex, lastLogTerm)
+		go raft.SendRequestVoteArgs(client, nodeID, term, lastLogIndex, lastLogTerm)
 	}
 }
 
@@ -155,16 +158,31 @@ func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 	}
 }
 
+// becomeLeader 初始化 Leader 状态并开启同步协程
 func (raft *Raft) becomeLeader() {
 	raft.role = Leader
-	// 停止选举
+	// 停止选举计时器
 	if !raft.electionTimer.Stop() {
 		select {
 		case <-raft.electionTimer.C:
 		default:
 		}
 	}
-	raft.heartbeatTimer = time.NewTimer(0) // 当为leader 快速宣布主权
+
+	lastLogIndex, _ := raft.logMgr.GetLastLogInfo()
+
+	// 初始化所有 Peer 的进度
+	for _, peer := range raft.peers {
+		// 乐观探测：从自己最后一条日志的下一条开始
+		raft.nextIndex[peer.ID] = lastLogIndex + 1
+		// 保守确认：目前尚未确认任何匹配
+		raft.matchIndex[peer.ID] = 0
+
+		// 为每个 Peer 启动专属的复制协程
+		go raft.Replicator(peer.ID)
+	}
+
+	fmt.Printf("[Node %s] Elected Leader, Term: %d\n", raft.nodeID, raft.currentTerm)
 }
 
 func (raft *Raft) sendHeartbeat() {
@@ -173,8 +191,163 @@ func (raft *Raft) sendHeartbeat() {
 	}
 }
 
-// SendRequestVote 发送投票请求
-func (raft *Raft) SendRequestVote(client pb.RaftInternalClient, nodeID string, term, lastLogIndex, lastLogTerm int64) {
+// Replicator 是专属 Peer 的同步协程，处理心跳与日志推送
+func (raft *Raft) Replicator(peerID string) {
+	// 获取该 peer 对应的 gRPC 客户端
+	var targetClient pb.RaftInternalClient
+	for i, p := range raft.peers {
+		if p.ID == peerID {
+			targetClient = raft.peersConn[i]
+			break
+		}
+	}
+
+	// 只要是 Leader 且节点没挂，就持续运行
+	for !raft.killed() {
+		raft.mu.RLock()
+		if raft.role != Leader {
+			raft.mu.RUnlock()
+			return
+		}
+		raft.mu.RUnlock()
+
+		select {
+		case <-raft.messageChan[peerID]: // 收到新日志信号
+		case <-time.After(raft.heartbeatDuration): // 达到心跳超时
+		}
+
+		// 执行具体的同步请求
+		raft.replicateTo(peerID, targetClient)
+	}
+}
+
+// replicateTo 构造并发送 AppendEntries RPC
+func (raft *Raft) replicateTo(peerID string, client pb.RaftInternalClient) {
+	raft.mu.RLock()
+	if raft.role != Leader {
+		raft.mu.RUnlock()
+		return
+	}
+
+	next := raft.nextIndex[peerID]
+	lastIndex, _ := raft.logMgr.GetLastLogInfo()
+
+	// 检查是否有日志需要发送（Batch 模式）
+	var entries []*pb.LogEntry
+	if lastIndex >= next {
+		// 从 logMgr 获取 next 之后的所有日志（工业级通常会在这里限制 maxEntries 数量）
+		rawEntries := raft.logMgr.GetEntriesFrom(next)
+		for _, ent := range rawEntries {
+			entries = append(entries, &pb.LogEntry{
+				Index:   ent.Index,
+				Term:    ent.Term,
+				Command: ent.Command,
+			})
+		}
+	}
+
+	prevIndex := next - 1
+	prevTerm := raft.logMgr.GetTermAtIndex(prevIndex)
+
+	args := &pb.AppendEntriesArgs{
+		Term:         raft.currentTerm,
+		LeaderId:     raft.nodeID,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: raft.commitIndex,
+	}
+	raft.mu.RUnlock()
+
+	// 发送 RPC（不持有锁，避免网络阻塞导致整个集群僵死）
+	resp, err := client.AppendEntries(raft.ctx, args)
+	if err != nil {
+		return
+	}
+
+	raft.mu.Lock()
+	defer raft.mu.Unlock()
+
+	// 1. 任期检查：如果对方任期更高，立即退位
+	if resp.Term > raft.currentTerm {
+		raft.currentTerm = resp.Term
+		raft.role = Follower
+		raft.votedFor = ""
+		raft.resetElectionTimer()
+		return
+	}
+
+	// 2. 状态合法性检查
+	if raft.role != Leader || args.Term != raft.currentTerm {
+		return
+	}
+
+	// 3. 处理回复
+	if resp.Success {
+		// 更新 matchIndex 和 nextIndex
+		newMatch := args.PrevLogIndex + int64(len(args.Entries))
+		if newMatch > raft.matchIndex[peerID] {
+			raft.matchIndex[peerID] = newMatch
+			raft.nextIndex[peerID] = newMatch + 1
+		}
+		// 每次成功同步后，尝试推进 commitIndex
+		raft.advanceCommitIndex()
+	} else {
+		// 快速回退逻辑：利用 Follower 返回的冲突信息直接跨 Term 跳跃
+		if resp.ConflictIndex > 0 {
+			raft.nextIndex[peerID] = resp.ConflictIndex
+		} else {
+			raft.nextIndex[peerID] = max(1, raft.nextIndex[peerID]-1)
+		}
+
+		// 失败后立即重新尝试（可选，取决于对同步速度的要求）
+		select {
+		case raft.messageChan[peerID] <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// advanceCommitIndex 统计 matchIndex 并尝试更新 commitIndex
+func (raft *Raft) advanceCommitIndex() {
+	if raft.role != Leader {
+		return
+	}
+
+	lastIndex, _ := raft.logMgr.GetLastLogInfo()
+
+	// 从当前的 commitIndex 往后找
+	for n := lastIndex; n > raft.commitIndex; n-- {
+		// 关键点：只能提交当前任期的日志（Raft 5.4.2）
+		if raft.logMgr.GetTermAtIndex(n) != raft.currentTerm {
+			continue
+		}
+
+		count := 1 // 算上 Leader 自己
+		for _, mIdx := range raft.matchIndex {
+			if mIdx >= n {
+				count++
+			}
+		}
+
+		// 如果大多数节点已同步
+		if count > (len(raft.peersConn)+1)/2 {
+			raft.commitIndex = n
+			// 唤醒 applyLoop 协程应用到状态机
+			raft.applyCond.Signal()
+			break
+		}
+	}
+}
+
+// killed 检查节点是否已停止
+func (raft *Raft) killed() bool {
+	// 这里可以根据你之前定义的 dead 变量进行原子检查
+	return false
+}
+
+// SendRequestVoteArgs 发送投票请求
+func (raft *Raft) SendRequestVoteArgs(client pb.RaftInternalClient, nodeID string, term, lastLogIndex, lastLogTerm int64) {
 	resp, err := client.RequestVote(raft.ctx, &pb.RequestVoteArgs{
 		Term:         term,
 		CandidateId:  nodeID,
@@ -187,6 +360,23 @@ func (raft *Raft) SendRequestVote(client pb.RaftInternalClient, nodeID string, t
 	}
 
 	raft.voteCh <- resp
+}
+
+func (raft *Raft) SendAppendEntriesArgs(client pb.RaftInternalClient, term, prevLogIndex, prevLogTerm int64) *pb.AppendEntriesReply {
+	resp, err := client.AppendEntries(raft.ctx, &pb.AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     raft.nodeID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: raft.commitIndex,
+	})
+
+	if err != nil {
+		fmt.Println("err:", err)
+		return nil
+	}
+
+	return resp
 }
 
 func (raft *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteArgs, opts ...grpc.CallOption) (*pb.RequestVoteReply, error) {
