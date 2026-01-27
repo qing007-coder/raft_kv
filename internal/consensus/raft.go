@@ -1,199 +1,354 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"log"
+	"net"
 	pb "raft_kv/internal/consensus/proto"
 	"raft_kv/internal/tools"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
+// Raft 实现了 Raft 共识算法的核心逻辑
 type Raft struct {
-	mu        sync.RWMutex
-	ctx       context.Context
-	peersConn []pb.RaftInternalClient
-	peers     []Node
-	nodeID    string
-	dead      int32
+	mu         sync.RWMutex            // 保护并发访问的锁
+	ctx        context.Context         // 上下文，用于控制协程生命周期
+	peersConn  []pb.RaftInternalClient // 与其他节点的 gRPC 连接
+	peers      []Node                  // 集群中其他节点的信息
+	nodeID     string                  // 当前节点的 ID
+	dead       int32                   // 节点是否已关闭的标志
+	grpcServer *grpc.Server            // gRPC 服务器实例
+	addr       string                  // 当前节点的 gRPC 地址
+	pb.UnimplementedRaftInternalServer
 
-	// --- 持久化状态 ---
-	persister   *Persister
-	currentTerm int64
-	votedFor    string
-	logMgr      *LogManager // 引入独立的日志管理器
+	// 持久化状态 - 这些字段会被保存到磁盘
+	persister   *Persister  // 负责状态持久化
+	currentTerm int64       // 当前任期号
+	votedFor    string      // 当前任期内投票给的节点 ID
+	logMgr      *LogManager // 日志管理器
 
-	// --- 内存状态 ---
-	commitIndex int64 // 改为 int64，与 LogEntry.Index 保持一致
-	lastApplied int64
-	role        NodeRole
+	// 内存状态 这些字段只存在于内存中
+	commitIndex int64    // 已提交的最高日志索引
+	lastApplied int64    // 已应用到状态机的最高日志索引
+	role        NodeRole // 当前节点的角色（Follower、Candidate、Leader）
 
-	// --- 状态通知 ---
-	applyCh   chan ApplyMsg // 放在 Raft 层，负责向上层应用推送数据
-	applyCond *sync.Cond    // 用于唤醒 applyLoop 协程
+	// 状态通知
+	applyCh   chan *ApplyMsg // 应用消息的通道
+	applyCond *sync.Cond     // 用于通知 applyLoop 有新的提交日志
 
-	// --- 计时器 ---
-	electionTimer     *time.Timer
-	heartbeatTimer    *time.Timer
-	heartbeatDuration time.Duration
-	voteCh            chan *pb.RequestVoteReply
-	votesReceived     map[string]bool
-	// --- Leader 独有状态 ---
-	// 工业级实现中，建议用 map[string]int64 对应 nodeID
-	messageChan map[string]chan struct{}
-	nextIndex   map[string]int64
-	matchIndex  map[string]int64
+	// 计时器相关
+	electionTimer     *time.Timer               // 选举超时计时器
+	heartbeatTimer    *time.Ticker              // 心跳计时器
+	heartbeatDuration time.Duration             // 心跳间隔
+	voteCh            chan *pb.RequestVoteReply // 接收投票回复的通道
+	votesReceived     map[string]bool           // 记录已收到的投票
+
+	// Leader 独有状态
+	messageChan map[string]chan struct{} // 向每个节点发送复制消息的通道
+	nextIndex   map[string]int64         // 每个节点下一个需要复制的日志索引
+	matchIndex  map[string]int64         // 每个节点已复制的最高日志索引
 }
 
-func NewRaft() *Raft {
+// NewRaft 创建一个新的 Raft 节点
+// basePath: 持久化存储的基础路径
+// applyCh: 应用日志到状态机的通道
+// configPath: 配置文件路径
+func NewRaft(basePath string, applyCh chan *ApplyMsg, configPath string) *Raft {
 	raft := new(Raft)
-	conf := NewNodeConfig()
-	raft.nodeID = conf.NodeID
-	peers := conf.Peers
+	conf := NewNodeConfig(configPath) // 获取节点配置
 	raft.peers = conf.Peers
+	raft.nodeID = conf.NodeID
+	raft.addr = conf.Addr
+	raft.persister = NewPersister(basePath)
+	raft.applyCh = applyCh
+	raft.logMgr = NewLogManager()
+
+	// 初始化与其他节点的连接和消息通道
 	raft.messageChan = make(map[string]chan struct{}, 1)
-	for _, peer := range peers {
+	for _, peer := range raft.peers {
+		// 建立 gRPC 连接
 		conn, err := grpc.NewClient(peer.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			fmt.Println("err:", err)
-			return nil
+			fmt.Printf("Connect to peer %s failed: %v\n", peer.ID, err)
+			continue
 		}
-
 		client := pb.NewRaftInternalClient(conn)
 		raft.peersConn = append(raft.peersConn, client)
 		raft.messageChan[peer.ID] = make(chan struct{}, 1)
 	}
 
+	// 初始化基本状态
 	raft.ctx = context.Background()
-	raft.nodeID = tools.CreateID()
-	raft.currentTerm = 0
 	raft.role = Follower
+	raft.currentTerm = 0
 	raft.votedFor = ""
-	raft.logMgr = NewLogManager()
 	raft.commitIndex = 0
 	raft.lastApplied = 0
-	raft.heartbeatDuration = time.Millisecond * 500
+	raft.heartbeatDuration = time.Millisecond * 150 // 心跳间隔设为 150ms
+
+	// 从持久化存储中恢复状态
+	raft.decodeState(raft.persister.ReadRaftState())
+
+	// 同步提交和应用索引与日志管理器的快照信息
+	raft.commitIndex = raft.logMgr.lastIncludedIndex
+	raft.lastApplied = raft.logMgr.lastIncludedIndex
+
+	// 初始化同步原语和计时器
 	raft.applyCond = sync.NewCond(&raft.mu)
-	raft.electionTimer = time.NewTimer(tools.RandDuration(1000, 2000))
-	// raft.heartbeatTimer = time.NewTimer(raft.heartbeatDuration)
+	raft.electionTimer = time.NewTimer(tools.RandDuration(1000, 2000)) // 选举超时设为 1-2s
 	raft.voteCh = make(chan *pb.RequestVoteReply, len(raft.peers))
 	raft.votesReceived = make(map[string]bool)
 	raft.nextIndex = make(map[string]int64)
 	raft.matchIndex = make(map[string]int64)
-	raft.applyCh = make(chan ApplyMsg, 100)
+
+	// 启动 gRPC 服务器
+	raft.grpcServer = grpc.NewServer()
+	pb.RegisterRaftInternalServer(raft.grpcServer, raft)
+
+	// 在新协程中启动 gRPC 服务器
+	go func() {
+		listener, err := net.Listen("tcp", raft.addr)
+		if err != nil {
+			log.Fatalf("Failed to start gRPC server: %v", err)
+		}
+		log.Printf("gRPC server started on %s", raft.addr)
+		if err := raft.grpcServer.Serve(listener); err != nil {
+			log.Fatalf("Failed to serve gRPC: %v", err)
+		}
+	}()
+
 	return raft
 }
 
-func (raft *Raft) Start() {
-
+// persist 将 Raft 的核心状态序列化并保存到磁盘
+func (raft *Raft) persist() {
+	data := raft.encodeState()
+	raft.persister.SaveStateAndSnapshot(data, raft.persister.ReadSnapshot())
 }
 
+// Start 启动 Raft 节点的核心协程
+// 包括运行状态机和应用日志到状态机的协程
+func (raft *Raft) Start() {
+	go raft.Run()
+	go raft.applyLoop()
+}
+
+// Run 运行 Raft 节点的主循环
+// 处理选举超时、投票回复和心跳事件
 func (raft *Raft) Run() {
+	// 初始化心跳计时器
+	raft.heartbeatTimer = time.NewTicker(raft.heartbeatDuration)
+	defer raft.heartbeatTimer.Stop()
+
 	for {
 		select {
 		case <-raft.electionTimer.C:
+			// 选举超时，开始新一轮选举
 			raft.startElection()
-			raft.electionTimer.Reset(tools.RandDuration(1000, 2000))
 
 		case resp := <-raft.voteCh:
+			// 收到投票回复，处理投票结果
 			raft.handleResponse(resp)
+
 		case <-raft.heartbeatTimer.C:
+			// 心跳计时器触发，发送心跳
 			raft.sendHeartbeat()
+
+		case <-raft.ctx.Done():
+			// 上下文取消，退出主循环
+			return
 		}
 	}
 }
 
-func (raft *Raft) startElection() {
+// Propose 向 Raft 集群提交一个命令
+// 只有 Leader 节点可以处理提议
+// 返回值：日志索引、当前任期、是否为 Leader
+func (raft *Raft) Propose(command []byte) (index int64, term int64, isLeader bool) {
 	raft.mu.Lock()
+	defer raft.mu.Unlock()
+
+	// 只有 Leader 可以处理提议
+	if raft.role != Leader {
+		return -1, -1, false
+	}
+
+	// 计算新日志的索引
+	lastIndex, _ := raft.logMgr.GetLastLogInfo()
+	newIndex := lastIndex + 1
+	currentTerm := raft.currentTerm
+
+	// 创建新的日志条目
+	newEntry := &pb.LogEntry{
+		Index: newIndex,
+		Term:  currentTerm,
+		Data:  command,
+	}
+
+	// 将新日志追加到日志管理器
+	raft.logMgr.Append([]*pb.LogEntry{newEntry})
+	// 写入新日志后立即持久化，确保崩溃后可以恢复
+	raft.persist()
+
+	// 通知所有 Follower 节点复制新日志
+	for peerID := range raft.messageChan {
+		select {
+		case raft.messageChan[peerID] <- struct{}{}:
+		default:
+			// 如果通道已满，跳过通知，等待下一次心跳
+		}
+	}
+
+	return newIndex, currentTerm, true
+}
+
+// startElection 开始新一轮选举
+// 当选举超时或接收到更高任期的请求时调用
+func (raft *Raft) startElection() {
+	// 重置选举计时器，避免重复触发选举
+	raft.resetElectionTimer()
+	raft.mu.Lock()
+	// 如果当前已经是 Leader，不需要选举
 	if raft.role == Leader {
 		raft.mu.Unlock()
 		return
 	}
 
+	// 转换为 Candidate 状态，开始选举
 	raft.role = Candidate
+	// 增加任期号
 	raft.currentTerm++
+	// 投票给自己
 	raft.votedFor = raft.nodeID
-	// 关键：清空上一任期的选票快照
+	// 重置投票记录，确保只记录当前任期的投票
 	raft.votesReceived = make(map[string]bool)
 
-	// 关键：锁定当前任期的快照传给协程
+	// 记录选举开始
 	term := raft.currentTerm
 	nodeID := raft.nodeID
+	log.Printf("Node %s starting election for term %d", nodeID, term)
+
+	// 持久化状态，确保崩溃后可以恢复
+	raft.persist()
+
 	lastLogIndex, lastLogTerm := raft.logMgr.GetLastLogInfo()
 	raft.mu.Unlock()
 
+	// 向所有其他节点发送投票请求
+	log.Printf("Node %s sending vote requests to all peers for term %d", nodeID, term)
 	for _, client := range raft.peersConn {
 		go raft.SendRequestVoteArgs(client, nodeID, term, lastLogIndex, lastLogTerm)
 	}
 }
 
+// handleResponse 处理投票请求的回复
+// 统计投票结果，决定是否成为 Leader
 func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 	raft.mu.Lock()
 	defer raft.mu.Unlock()
 
+	// 如果收到更高任期的回复，更新自己的任期并转为 Follower
 	if resp.Term > raft.currentTerm {
+		log.Printf("Node %s received higher term %d from %s, converting to Follower", raft.nodeID, resp.Term, resp.PeerId)
 		raft.currentTerm = resp.Term
 		raft.role = Follower
 		raft.votedFor = ""
+		// 持久化状态变化
+		raft.persist()
+		// 重置选举计时器
+		raft.resetElectionTimer()
 		return
 	}
 
+	// 如果当前不是 Candidate，或者回复的任期小于当前任期，忽略该回复
 	if raft.role != Candidate || resp.Term < raft.currentTerm {
 		return
 	}
 
+	// 记录投票结果
 	raft.votesReceived[resp.PeerId] = resp.VoteGranted
+	log.Printf("Node %s received vote from %s: %t for term %d", raft.nodeID, resp.PeerId, resp.VoteGranted, resp.Term)
 
-	grantedCount := 1 // 初始 1 票（自己）
+	// 统计获得的赞成票数量
+	grantedCount := 1 // 自己的一票
 	for _, granted := range raft.votesReceived {
 		if granted {
 			grantedCount++
 		}
 	}
 
-	if grantedCount > (len(raft.peersConn)+1)/2 {
+	// 计算集群总节点数（包括自己）
+	totalNodes := len(raft.peersConn) + 1
+	log.Printf("Node %s has received %d votes out of %d needed for term %d", raft.nodeID, grantedCount, (totalNodes/2)+1, raft.currentTerm)
+
+	// 如果获得超过半数的赞成票，成为 Leader
+	if grantedCount > totalNodes/2 {
 		raft.becomeLeader()
 	}
 }
 
-// becomeLeader 初始化 Leader 状态并开启同步协程
+// becomeLeader 转换为 Leader 状态
+// 当获得超过半数的投票时调用
 func (raft *Raft) becomeLeader() {
+	// 转换为 Leader 状态
 	raft.role = Leader
-	// 停止选举计时器
-	if !raft.electionTimer.Stop() {
-		select {
-		case <-raft.electionTimer.C:
-		default:
-		}
-	}
+	// 停止选举计时器，因为 Leader 不需要选举
+	raft.electionTimer.Stop()
 
+	// 获取当前最后一条日志的索引
 	lastLogIndex, _ := raft.logMgr.GetLastLogInfo()
 
-	// 初始化所有 Peer 的进度
+	// 初始化每个 Follower 的 nextIndex 和 matchIndex
 	for _, peer := range raft.peers {
-		// 乐观探测：从自己最后一条日志的下一条开始
+		// nextIndex 初始化为最后一条日志的下一个位置
 		raft.nextIndex[peer.ID] = lastLogIndex + 1
-		// 保守确认：目前尚未确认任何匹配
+		// matchIndex 初始化为 0
 		raft.matchIndex[peer.ID] = 0
-
-		// 为每个 Peer 启动专属的复制协程
+		// 为每个 Follower 启动一个复制协程
 		go raft.Replicator(peer.ID)
 	}
 
-	fmt.Printf("[Node %s] Elected Leader, Term: %d\n", raft.nodeID, raft.currentTerm)
+	// 记录成为 Leader
+	log.Printf("Node %s became Leader for term %d", raft.nodeID, raft.currentTerm)
+	// 发送初始心跳，通知其他节点自己成为了 Leader
+	raft.sendHeartbeat()
 }
 
+// sendHeartbeat 发送心跳消息给所有 Follower
+// 保持 Leader 地位，防止 Follower 超时选举
 func (raft *Raft) sendHeartbeat() {
-	for _, client := range raft.peersConn {
-		go client.AppendEntries(raft.ctx, &pb.AppendEntriesArgs{})
+	raft.mu.RLock()
+	defer raft.mu.RUnlock()
+
+	// 只有 Leader 才需要发送心跳
+	if raft.role != Leader {
+		return
+	}
+
+	// 记录发送心跳
+	log.Printf("Leader %s sending heartbeat for term %d", raft.nodeID, raft.currentTerm)
+
+	// 通知所有 Follower 节点发送心跳（空日志条目）
+	for _, peer := range raft.peers {
+		select {
+		case raft.messageChan[peer.ID] <- struct{}{}:
+		default:
+			// 如果通道已满，跳过通知，等待下一次心跳
+		}
 	}
 }
 
-// Replicator 是专属 Peer 的同步协程，处理心跳与日志推送
+// Replicator 是 Leader 节点上的复制协程
+// 负责将日志复制到指定的 Follower 节点
 func (raft *Raft) Replicator(peerID string) {
-	// 获取该 peer 对应的 gRPC 客户端
+	// 找到目标节点的 gRPC 客户端
 	var targetClient pb.RaftInternalClient
 	for i, p := range raft.peers {
 		if p.ID == peerID {
@@ -202,105 +357,179 @@ func (raft *Raft) Replicator(peerID string) {
 		}
 	}
 
-	// 只要是 Leader 且节点没挂，就持续运行
+	// 只要节点未关闭且仍是 Leader，就持续复制日志
 	for !raft.killed() {
 		raft.mu.RLock()
+		// 如果不再是 Leader，退出复制协程
 		if raft.role != Leader {
 			raft.mu.RUnlock()
 			return
 		}
 		raft.mu.RUnlock()
 
+		// 等待复制通知或心跳超时
 		select {
-		case <-raft.messageChan[peerID]: // 收到新日志信号
-		case <-time.After(raft.heartbeatDuration): // 达到心跳超时
+		case <-raft.messageChan[peerID]:
+			// 收到复制通知，立即执行复制
+		case <-time.After(raft.heartbeatDuration):
+			// 心跳超时，发送心跳（空日志）
 		}
 
-		// 执行具体的同步请求
+		// 执行日志复制
 		raft.replicateTo(peerID, targetClient)
 	}
 }
 
-// replicateTo 构造并发送 AppendEntries RPC
+// replicateTo 将日志复制到指定的 Follower 节点
+// 是日志复制的核心逻辑
 func (raft *Raft) replicateTo(peerID string, client pb.RaftInternalClient) {
 	raft.mu.RLock()
+	// 如果不再是 Leader，停止复制
 	if raft.role != Leader {
 		raft.mu.RUnlock()
 		return
 	}
 
+	// 获取下一个需要复制的日志索引
 	next := raft.nextIndex[peerID]
+	// 获取当前最后一条日志的索引
 	lastIndex, _ := raft.logMgr.GetLastLogInfo()
 
-	// 检查是否有日志需要发送（Batch 模式）
-	var entries []*pb.LogEntry
-	if lastIndex >= next {
-		// 从 logMgr 获取 next 之后的所有日志（工业级通常会在这里限制 maxEntries 数量）
-		rawEntries := raft.logMgr.GetEntriesFrom(next)
-		for _, ent := range rawEntries {
-			entries = append(entries, &pb.LogEntry{
-				Index:   ent.Index,
-				Term:    ent.Term,
-				Command: ent.Command,
-			})
+	// 如果 nextIndex 已经被包含在快照中，需要发送快照
+	if next <= raft.logMgr.lastIncludedIndex {
+		// 准备快照数据
+		lastIncludedIndex := raft.logMgr.lastIncludedIndex
+		lastIncludedTerm := raft.logMgr.lastIncludedTerm
+		snapshotData := raft.persister.ReadSnapshot()
+		raft.mu.RUnlock()
+
+		// 构造 InstallSnapshot 请求
+		snapshotArgs := &pb.InstallSnapshotArgs{
+			Term:              raft.currentTerm,
+			LeaderId:          raft.nodeID,
+			LastIncludedIndex: lastIncludedIndex,
+			LastIncludedTerm:  lastIncludedTerm,
+			Data:              snapshotData,
 		}
+
+		// 记录发送快照请求
+		log.Printf("Leader %s sending InstallSnapshot to %s: lastIncludedIndex=%d, lastIncludedTerm=%d",
+			raft.nodeID, peerID, lastIncludedIndex, lastIncludedTerm)
+
+		// 发送 InstallSnapshot RPC
+		snapshotResp, err := client.InstallSnapshot(raft.ctx, snapshotArgs)
+		if err != nil {
+			// 网络错误，暂时忽略，等待下一次重试
+			log.Printf("Leader %s failed to send InstallSnapshot to %s: %v", raft.nodeID, peerID, err)
+			return
+		}
+
+		raft.mu.Lock()
+		defer raft.mu.Unlock()
+
+		// 如果收到更高任期的回复，更新自己的任期并转为 Follower
+		if snapshotResp.Term > raft.currentTerm {
+			log.Printf("Leader %s received higher term %d from %s, converting to Follower", raft.nodeID, snapshotResp.Term, peerID)
+			raft.currentTerm = snapshotResp.Term
+			raft.role = Follower
+			raft.votedFor = ""
+			// 持久化状态变化
+			raft.persist()
+			// 重置选举计时器
+			raft.resetElectionTimer()
+			return
+		}
+
+		// 更新 nextIndex 和 matchIndex
+		raft.nextIndex[peerID] = lastIncludedIndex + 1
+		raft.matchIndex[peerID] = lastIncludedIndex
+		log.Printf("Leader %s updated nextIndex[%s] to %d, matchIndex[%s] to %d after snapshot",
+			raft.nodeID, peerID, raft.nextIndex[peerID], peerID, raft.matchIndex[peerID])
+
+		// 尝试推进 commitIndex
+		raft.advanceCommitIndex()
+		return
 	}
 
+	// 准备需要复制的日志条目
+	var entries []*pb.LogEntry
+	if lastIndex >= next {
+		// 获取从 next 开始的所有日志条目
+		entries = raft.logMgr.GetEntriesFrom(next)
+	}
+
+	// 计算前一个日志条目的索引和任期
 	prevIndex := next - 1
 	prevTerm := raft.logMgr.GetTermAtIndex(prevIndex)
 
+	// 构造 AppendEntries 请求
 	args := &pb.AppendEntriesArgs{
-		Term:         raft.currentTerm,
-		LeaderId:     raft.nodeID,
-		PrevLogIndex: prevIndex,
-		PrevLogTerm:  prevTerm,
-		Entries:      entries,
-		LeaderCommit: raft.commitIndex,
+		Term:         raft.currentTerm, // 当前任期
+		LeaderId:     raft.nodeID,      // Leader 的 ID
+		PrevLogIndex: prevIndex,        // 前一个日志条目的索引
+		PrevLogTerm:  prevTerm,         // 前一个日志条目的任期
+		Entries:      entries,          // 需要复制的日志条目
+		LeaderCommit: raft.commitIndex, // Leader 的提交索引
 	}
 	raft.mu.RUnlock()
 
-	// 发送 RPC（不持有锁，避免网络阻塞导致整个集群僵死）
+	// 记录发送 AppendEntries 请求
+	log.Printf("Leader %s sending AppendEntries to %s: prevIndex=%d, prevTerm=%d, entriesCount=%d", raft.nodeID, peerID, prevIndex, prevTerm, len(entries))
+
+	// 发送 AppendEntries RPC
 	resp, err := client.AppendEntries(raft.ctx, args)
 	if err != nil {
+		// 网络错误，暂时忽略，等待下一次重试
+		log.Printf("Leader %s failed to send AppendEntries to %s: %v", raft.nodeID, peerID, err)
 		return
 	}
 
 	raft.mu.Lock()
 	defer raft.mu.Unlock()
 
-	// 1. 任期检查：如果对方任期更高，立即退位
+	// 如果收到更高任期的回复，更新自己的任期并转为 Follower
 	if resp.Term > raft.currentTerm {
+		log.Printf("Leader %s received higher term %d from %s, converting to Follower", raft.nodeID, resp.Term, peerID)
 		raft.currentTerm = resp.Term
 		raft.role = Follower
 		raft.votedFor = ""
+		// 持久化状态变化
+		raft.persist()
+		// 重置选举计时器
 		raft.resetElectionTimer()
 		return
 	}
 
-	// 2. 状态合法性检查
+	// 如果当前不再是 Leader，或者请求的任期与当前任期不符，忽略回复
 	if raft.role != Leader || args.Term != raft.currentTerm {
 		return
 	}
 
-	// 3. 处理回复
+	// 处理复制成功的情况
 	if resp.Success {
-		// 更新 matchIndex 和 nextIndex
+		// 计算新的匹配索引
 		newMatch := args.PrevLogIndex + int64(len(args.Entries))
+		// 更新匹配索引和下一个索引
 		if newMatch > raft.matchIndex[peerID] {
+			log.Printf("Leader %s successfully replicated logs to %s, new matchIndex=%d", raft.nodeID, peerID, newMatch)
 			raft.matchIndex[peerID] = newMatch
 			raft.nextIndex[peerID] = newMatch + 1
 		}
-		// 每次成功同步后，尝试推进 commitIndex
+		// 尝试推进提交索引
 		raft.advanceCommitIndex()
 	} else {
-		// 快速回退逻辑：利用 Follower 返回的冲突信息直接跨 Term 跳跃
+		// 处理复制失败的情况
+		log.Printf("Leader %s failed to replicate logs to %s, conflictIndex=%d", raft.nodeID, peerID, resp.ConflictIndex)
 		if resp.ConflictIndex > 0 {
-			raft.nextIndex[peerID] = resp.ConflictIndex
+			// 根据冲突索引调整下一个索引
+			// 确保下一个索引不会小于快照的最后索引
+			raft.nextIndex[peerID] = max(raft.logMgr.lastIncludedIndex+1, resp.ConflictIndex)
 		} else {
-			raft.nextIndex[peerID] = max(1, raft.nextIndex[peerID]-1)
+			// 线性查找，逐个回退
+			// 确保下一个索引不会小于快照的最后索引
+			raft.nextIndex[peerID] = max(raft.logMgr.lastIncludedIndex+1, raft.nextIndex[peerID]-1)
 		}
-
-		// 失败后立即重新尝试（可选，取决于对同步速度的要求）
+		// 重新尝试复制
 		select {
 		case raft.messageChan[peerID] <- struct{}{}:
 		default:
@@ -308,290 +537,430 @@ func (raft *Raft) replicateTo(peerID string, client pb.RaftInternalClient) {
 	}
 }
 
-// advanceCommitIndex 统计 matchIndex 并尝试更新 commitIndex
+// advanceCommitIndex 尝试推进提交索引
+// 当有新的日志被复制到多数节点时调用
 func (raft *Raft) advanceCommitIndex() {
-	if raft.role != Leader {
-		return
-	}
-
+	// 获取当前最后一条日志的索引
 	lastIndex, _ := raft.logMgr.GetLastLogInfo()
-
-	// 从当前的 commitIndex 往后找
+	// 计算集群总节点数（包括自己）
+	totalNodes := len(raft.peersConn) + 1
+	// 从最后一条日志开始，向前查找可以提交的日志
 	for n := lastIndex; n > raft.commitIndex; n-- {
-		// 关键点：只能提交当前任期的日志（Raft 5.4.2）
+		// 只考虑当前任期的日志
 		if raft.logMgr.GetTermAtIndex(n) != raft.currentTerm {
 			continue
 		}
 
-		count := 1 // 算上 Leader 自己
+		// 统计已经复制了该日志的节点数量
+		count := 1 // 自己的一票
 		for _, mIdx := range raft.matchIndex {
 			if mIdx >= n {
 				count++
 			}
 		}
 
-		// 如果大多数节点已同步
-		if count > (len(raft.peersConn)+1)/2 {
+		// 如果超过半数的节点已经复制了该日志，提交它
+		if count > totalNodes/2 {
+			oldCommitIndex := raft.commitIndex
 			raft.commitIndex = n
-			// 唤醒 applyLoop 协程应用到状态机
+			// 通知 applyLoop 有新的日志需要应用
 			raft.applyCond.Signal()
+			// 记录提交索引的推进
+			log.Printf("Leader %s advanced commitIndex from %d to %d for term %d", raft.nodeID, oldCommitIndex, raft.commitIndex, raft.currentTerm)
 			break
 		}
 	}
 }
 
-// killed 检查节点是否已停止
-func (raft *Raft) killed() bool {
-	// 这里可以根据你之前定义的 dead 变量进行原子检查
-	return false
-}
-
-// SendRequestVoteArgs 发送投票请求
+// SendRequestVoteArgs 发送投票请求并处理回复
+// 是选举过程中的关键函数
 func (raft *Raft) SendRequestVoteArgs(client pb.RaftInternalClient, nodeID string, term, lastLogIndex, lastLogTerm int64) {
-	resp, err := client.RequestVote(raft.ctx, &pb.RequestVoteArgs{
-		Term:         term,
-		CandidateId:  nodeID,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	})
+	// 构造投票请求参数
+	args := &pb.RequestVoteArgs{
+		Term:         term,         // 候选者的任期
+		CandidateId:  nodeID,       // 候选者的 ID
+		LastLogIndex: lastLogIndex, // 候选者最后一条日志的索引
+		LastLogTerm:  lastLogTerm,  // 候选者最后一条日志的任期
+	}
+
+	// 记录发送投票请求
+	log.Printf("Candidate %s sending vote request for term %d, lastLogIndex=%d, lastLogTerm=%d", nodeID, term, lastLogIndex, lastLogTerm)
+
+	// 设置 RPC 超时，防止某个节点宕机导致协程永久阻塞
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1)
+	defer cancel()
+
+	// 发送投票请求 RPC
+	resp, err := client.RequestVote(ctx, args)
 	if err != nil {
-		fmt.Println("err:", err)
+		// 网络错误，暂时忽略，选举过程中部分节点失败是正常的
+		log.Printf("Candidate %s failed to send vote request: %v", nodeID, err)
 		return
 	}
 
-	raft.voteCh <- resp
-}
+	// 记录收到投票回复
+	log.Printf("Candidate %s received vote reply: granted=%t, term=%d", nodeID, resp.VoteGranted, resp.Term)
 
-func (raft *Raft) SendAppendEntriesArgs(client pb.RaftInternalClient, term, prevLogIndex, prevLogTerm int64) *pb.AppendEntriesReply {
-	resp, err := client.AppendEntries(raft.ctx, &pb.AppendEntriesArgs{
-		Term:         term,
-		LeaderId:     raft.nodeID,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		LeaderCommit: raft.commitIndex,
-	})
-
-	if err != nil {
-		fmt.Println("err:", err)
-		return nil
+	// 将投票结果推送到处理管道
+	select {
+	case <-raft.ctx.Done():
+		// 上下文取消，退出
+		return
+	case raft.voteCh <- resp:
+		// 成功将结果推入管道
+	default:
+		// 如果管道满了，说明处理速度跟不上，但在 Raft 选举中这通常意味着结果已经足够了
 	}
-
-	return resp
 }
 
-func (raft *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteArgs, opts ...grpc.CallOption) (*pb.RequestVoteReply, error) {
+// RequestVote 处理来自其他节点的投票请求
+// 实现了 Raft 选举中的投票逻辑
+func (raft *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteArgs) (*pb.RequestVoteReply, error) {
 	raft.mu.Lock()
 	defer raft.mu.Unlock()
-	clear(raft.votesReceived)
 
-	resp := pb.RequestVoteReply{
+	// 记录收到投票请求
+	log.Printf("Node %s received vote request from %s for term %d, lastLogIndex=%d, lastLogTerm=%d", raft.nodeID, req.CandidateId, req.Term, req.LastLogIndex, req.LastLogTerm)
+
+	// 初始化投票回复
+	resp := &pb.RequestVoteReply{
 		Term:        raft.currentTerm,
 		VoteGranted: false,
 		PeerId:      raft.nodeID,
 	}
 
+	// 如果请求的任期小于当前任期，拒绝投票
 	if req.Term < raft.currentTerm {
-		return &resp, nil
+		log.Printf("Node %s rejecting vote for term %d (current term is %d)", raft.nodeID, req.Term, raft.currentTerm)
+		return resp, nil
 	}
 
+	// 如果请求的任期大于当前任期，更新自己的任期并转为 Follower
 	if req.Term > raft.currentTerm {
+		log.Printf("Node %s updating term from %d to %d and becoming Follower", raft.nodeID, raft.currentTerm, req.Term)
 		raft.currentTerm = req.Term
 		raft.role = Follower
 		raft.votedFor = ""
-		// 这里可能需要持久化
+		// 持久化状态变化
+		raft.persist()
 	}
 
-	if raft.votedFor == "" || raft.votedFor == req.CandidateId { // 这里的条件是防止网络波动 nodeA向nodeB发送请求 A做出了响应 但是响应过程中丢失了 nodeB可能会重试
+	// 如果还没有投票，或者已经投票给了该候选者
+	if raft.votedFor == "" || raft.votedFor == req.CandidateId {
+		// 获取自己最后一条日志的信息
 		lastLogIndex, lastLogTerm := raft.logMgr.GetLastLogInfo()
 
-		isVoted := false
+		// 检查候选者的日志是否比自己的更新
+		upToDate := false
 		if req.LastLogTerm > lastLogTerm {
-			isVoted = true
-		} else if lastLogTerm == req.LastLogTerm && req.LastLogIndex >= lastLogIndex {
-			isVoted = true
+			// 候选者的最后一条日志的任期更大，更新
+			upToDate = true
+		} else if req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex {
+			// 任期相同，但候选者的日志更长，更新
+			upToDate = true
 		}
 
-		if isVoted {
+		// 如果候选者的日志更新，授予投票
+		if upToDate {
+			log.Printf("Node %s granting vote to %s for term %d", raft.nodeID, req.CandidateId, req.Term)
 			raft.role = Follower
 			raft.votedFor = req.CandidateId
+			// 持久化投票记录
+			raft.persist()
+			// 重置选举计时器
 			raft.resetElectionTimer()
 			resp.VoteGranted = true
+		} else {
+			log.Printf("Node %s rejecting vote to %s: log not up to date", raft.nodeID, req.CandidateId)
 		}
-
+	} else {
+		log.Printf("Node %s rejecting vote to %s: already voted for %s", raft.nodeID, req.CandidateId, raft.votedFor)
 	}
 
+	// 更新回复中的任期
 	resp.Term = raft.currentTerm
-	return &resp, nil
+	log.Printf("Node %s sending vote reply to %s: granted=%t, term=%d", raft.nodeID, req.CandidateId, resp.VoteGranted, resp.Term)
+	return resp, nil
 }
 
-func (raft *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesArgs, opts ...grpc.CallOption) (*pb.AppendEntriesReply, error) {
+// InstallSnapshot 处理来自 Leader 的快照安装请求
+// 当 Follower 落后太多时，Leader 会发送快照而不是日志条目
+func (raft *Raft) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotArgs) (*pb.InstallSnapshotReply, error) {
 	raft.mu.Lock()
 	defer raft.mu.Unlock()
 
+	// 记录收到快照请求
+	log.Printf("Node %s received InstallSnapshot from %s: term=%d, lastIncludedIndex=%d, lastIncludedTerm=%d",
+		raft.nodeID, req.LeaderId, req.Term, req.LastIncludedIndex, req.LastIncludedTerm)
+
+	// 初始化回复
+	resp := &pb.InstallSnapshotReply{
+		Term: raft.currentTerm,
+	}
+
+	// 如果请求的任期小于当前任期，拒绝请求
+	if req.Term < raft.currentTerm {
+		log.Printf("Node %s rejecting InstallSnapshot: req term %d < current term %d", raft.nodeID, req.Term, raft.currentTerm)
+		return resp, nil
+	}
+
+	// 如果请求的任期大于当前任期，更新自己的任期
+	if req.Term > raft.currentTerm {
+		log.Printf("Node %s updating term from %d to %d and becoming Follower", raft.nodeID, raft.currentTerm, req.Term)
+		raft.currentTerm = req.Term
+		raft.votedFor = ""
+		// 持久化状态变化
+		raft.persist()
+	}
+
+	// 转为 Follower 状态，并重置选举计时器
+	raft.role = Follower
+	raft.resetElectionTimer()
+
+	// 检查快照是否比当前快照更新
+	if req.LastIncludedIndex <= raft.logMgr.lastIncludedIndex {
+		// 快照不新，无需处理
+		log.Printf("Node %s rejecting InstallSnapshot: snapshot not newer", raft.nodeID)
+		return resp, nil
+	}
+
+	// 应用快照到状态机
+	snapshotMsg := &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      req.Data,
+		SnapshotIndex: int(req.LastIncludedIndex),
+		SnapshotTerm:  int(req.LastIncludedTerm),
+	}
+
+	// 发送快照到 applyCh
+	select {
+	case raft.applyCh <- snapshotMsg:
+		// 快照已发送到状态机
+		log.Printf("Node %s sent snapshot to applyCh", raft.nodeID)
+	default:
+		// 如果通道满了，记录错误但继续处理
+		log.Printf("Node %s failed to send snapshot to applyCh: channel full", raft.nodeID)
+	}
+
+	// 更新日志管理器的快照元数据
+	raft.logMgr.ResetWithSnapshot(req.LastIncludedIndex, req.LastIncludedTerm)
+
+	// 更新 commitIndex 和 lastApplied
+	raft.commitIndex = req.LastIncludedIndex
+	raft.lastApplied = req.LastIncludedIndex
+
+	// 持久化状态
+	raft.persist()
+	log.Printf("Node %s applied snapshot up to index %d, term %d", raft.nodeID, req.LastIncludedIndex, req.LastIncludedTerm)
+
+	// 更新回复中的任期
+	resp.Term = raft.currentTerm
+	return resp, nil
+}
+
+// AppendEntries 处理来自 Leader 的日志复制请求
+// 也用于发送心跳，维持 Leader 地位
+func (raft *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesArgs) (*pb.AppendEntriesReply, error) {
+	raft.mu.Lock()
+	defer raft.mu.Unlock()
+
+	// 记录收到 AppendEntries 请求
+	log.Printf("Node %s received AppendEntries from %s: term=%d, prevLogIndex=%d, prevLogTerm=%d, entriesCount=%d, leaderCommit=%d",
+		raft.nodeID, req.LeaderId, req.Term, req.PrevLogIndex, req.PrevLogTerm, len(req.Entries), req.LeaderCommit)
+
+	// 初始化回复
 	resp := &pb.AppendEntriesReply{
 		Term:    raft.currentTerm,
 		Success: false,
 	}
 
-	// 任期检查：对方任期比我小，直接拒绝
+	// 如果请求的任期小于当前任期，拒绝请求
 	if req.Term < raft.currentTerm {
+		log.Printf("Node %s rejecting AppendEntries: req term %d < current term %d", raft.nodeID, req.Term, raft.currentTerm)
 		return resp, nil
 	}
 
-	// 发现更高任期或合法的现任 Leader，重置状态
-	// 只要 req.Term >= rf.currentTerm，就承认对方是有效 Leader
+	// 如果请求的任期大于当前任期，更新自己的任期
 	if req.Term > raft.currentTerm {
+		log.Printf("Node %s updating term from %d to %d and becoming Follower", raft.nodeID, raft.currentTerm, req.Term)
 		raft.currentTerm = req.Term
 		raft.votedFor = ""
-		// 持久化更新后的 Term
+		// 持久化状态变化
+		raft.persist()
 	}
 
+	// 转为 Follower 状态，并重置选举计时器
 	raft.role = Follower
-	raft.resetElectionTimer() // 只有这里重置了，Follower 才不会造反
+	raft.resetElectionTimer()
 
-	// 日志一致性检查 (PrevLogIndex & PrevLogTerm)
+	// 日志对账：检查前一个日志条目是否匹配
 	if !raft.logMgr.MatchLog(req.PrevLogIndex, req.PrevLogTerm) {
-		// 快速回溯逻辑：告诉 Leader 我这里哪里不匹配，让他一次跳过一个 Term
+		// 日志不匹配，返回冲突信息
 		resp.ConflictIndex, resp.ConflictTerm = raft.logMgr.GetConflictInfo(req.PrevLogIndex)
 		resp.Term = raft.currentTerm
+		log.Printf("Node %s rejecting AppendEntries: log mismatch at index %d, term %d", raft.nodeID, req.PrevLogIndex, req.PrevLogTerm)
 		return resp, nil
 	}
 
-	// 写入日志并处理冲突 (Truncate & Append)
+	// 写入日志：只添加新的日志条目
+	logChanged := false
 	for i, entry := range req.Entries {
-		// 如果遇到 Index 相同但 Term 不同的，说明冲突了，删除后面所有并覆盖
+		// 如果日志条目不匹配，截断并添加新日志
 		if !raft.logMgr.IsEntryMatch(entry.Index, entry.Term) {
 			raft.logMgr.TruncateFrom(entry.Index)
 			raft.logMgr.Append(req.Entries[i:])
+			logChanged = true
+			log.Printf("Node %s appending log entries from index %d", raft.nodeID, entry.Index)
 			break
 		}
 	}
 
-	// 5. 更新本地 commitIndex
-	if req.LeaderCommit > raft.commitIndex {
-		// commitIndex 不能超过本地最新日志的索引
-		lastIdx, _ := raft.logMgr.GetLastLogInfo()
-		raft.commitIndex = min(req.LeaderCommit, lastIdx)
-
-		// 唤醒 apply 协程，把日志写入 s.store
-		raft.applyCond.Signal()
+	// 如果日志发生变化，持久化
+	if logChanged {
+		raft.persist()
+		log.Printf("Node %s persisted log changes", raft.nodeID)
 	}
 
+	// 更新提交索引
+	if req.LeaderCommit > raft.commitIndex {
+		lastIdx, _ := raft.logMgr.GetLastLogInfo()
+		oldCommitIndex := raft.commitIndex
+		// 提交索引不能超过最后一条日志的索引
+		raft.commitIndex = min(req.LeaderCommit, lastIdx)
+		// 通知 applyLoop 有新的日志需要应用
+		raft.applyCond.Signal()
+		log.Printf("Node %s advanced commitIndex from %d to %d", raft.nodeID, oldCommitIndex, raft.commitIndex)
+	}
+
+	// 回复成功
 	resp.Success = true
 	resp.Term = raft.currentTerm
+	log.Printf("Node %s sending AppendEntries reply: success=%t, term=%d", raft.nodeID, resp.Success, resp.Term)
 	return resp, nil
 }
 
-func (raft *Raft) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotArgs, opts ...grpc.CallOption) (*pb.InstallSnapshotReply, error) {
-	raft.mu.Lock()
-	defer raft.mu.Unlock()
-
-	resp := &pb.InstallSnapshotReply{Term: raft.currentTerm}
-
-	// 1. 任期检查
-	if req.Term < raft.currentTerm {
-		return resp, nil
-	}
-
-	// 2. 状态机转换
-	if req.Term > raft.currentTerm {
-		raft.currentTerm = req.Term
-		raft.votedFor = ""
-		raft.role = Follower
-		// raft.persist() // 之后统一在 SaveStateAndSnapshot 处理
-	}
-
-	// 3. 幂等检查：如果本地快照已经比请求的新，直接跳过
-	if req.LastIncludedIndex <= raft.logMgr.lastIncludedIndex {
-		return resp, nil
-	}
-
-	// 4. 日志对齐
-	if raft.logMgr.IsEntryMatch(req.LastIncludedIndex, req.LastIncludedTerm) {
-		// 如果快照点匹配，保留后面的日志（减少同步开销）
-		raft.logMgr.TruncateBefore(req.LastIncludedIndex, req.LastIncludedTerm)
-	} else {
-		// 如果不匹配，彻底清空，从快照开始新生活
-		raft.logMgr.ResetWithSnapshot(req.LastIncludedIndex, req.LastIncludedTerm)
-	}
-
-	// 5. 核心持久化：将 Raft 状态和快照二进制数据存入 Persister
-	//raft.persister.SaveStateAndSnapshot(raft.serializeState(), req.Data)
-
-	// 6. 推进进度
-	if req.LastIncludedIndex > raft.commitIndex {
-		raft.commitIndex = req.LastIncludedIndex
-	}
-	if req.LastIncludedIndex > raft.lastApplied {
-		raft.lastApplied = req.LastIncludedIndex
-	}
-
-	// 7. 异步通知上层 KV Server 应用快照
-	go func(data []byte, term, index int64) {
-		raft.applyCh <- ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      data,
-			SnapshotTerm:  int(term),
-			SnapshotIndex: int(index),
-		}
-	}(req.Data, req.LastIncludedTerm, req.LastIncludedIndex)
-
-	return resp, nil
-}
-
-func (raft *Raft) resetElectionTimer() {
-	if !raft.electionTimer.Stop() {
-		select {
-		case <-raft.electionTimer.C: // 如果已经到期了，把它读出来丢掉
-		default:
-		}
-	}
-	raft.electionTimer.Reset(tools.RandDuration(1000, 2000))
-}
-
+// applyLoop 是一个无限循环，负责将已提交的日志应用到状态机
+// 当有新的日志被提交时，会被唤醒执行应用操作
 func (raft *Raft) applyLoop() {
 	for {
 		raft.mu.Lock()
-
-		// 如果没有新日志需要 apply，就一直在这等（释放锁并阻塞）
+		// 如果没有新的日志需要应用，等待信号
 		for raft.lastApplied >= raft.commitIndex {
-			raft.applyCond.Wait() // 会自动释放 rf.mu，并阻塞在这里
-			// 被唤醒后，Wait() 会重新抢到 rf.mu 锁
+			raft.applyCond.Wait()
 		}
 
-		// 发现 commitIndex 推进了，准备批量取出日志
+		// 如果 lastApplied 落后于快照的索引，直接更新到快照索引
 		if raft.lastApplied < raft.logMgr.lastIncludedIndex {
-			// 说明中间这段日志已经通过快照直接更新到状态机了
-			// 我们直接跳过这部分，更新进度条
 			raft.lastApplied = raft.logMgr.lastIncludedIndex
 			raft.mu.Unlock()
 			continue
 		}
+
+		// 保存当前的提交索引和已应用索引，避免在解锁后被修改
 		commitIndex := raft.commitIndex
 		lastApplied := raft.lastApplied
 
-		// 找出需要发送给状态机的日志切片 并且备份 释放锁
-		entries := make([]LogEntry, 0)
+		// 收集需要应用的日志条目
+		var entries []LogEntry
 		for i := lastApplied + 1; i <= commitIndex; i++ {
-			// 这里用到你之前的 getPhysicalIndex 逻辑
+			// 获取日志条目的物理索引
 			pIdx := raft.logMgr.getPhysicalIndex(i)
-			entries = append(entries, raft.logMgr.entries[pIdx])
+			if pIdx >= 0 && pIdx < len(raft.logMgr.entries) {
+				entries = append(entries, raft.logMgr.entries[pIdx])
+			}
+		}
+		raft.mu.Unlock()
+
+		// 记录应用日志
+		if len(entries) > 0 {
+			log.Printf("Node %s applying %d log entries from index %d to %d", raft.nodeID, len(entries), lastApplied+1, commitIndex)
 		}
 
-		raft.mu.Unlock() // 发送 channel 前先解锁，避免阻塞
-
-		// 把日志应用到状态机（kv server）
+		// 将日志条目应用到状态机
 		for _, entry := range entries {
-			raft.applyCh <- ApplyMsg{
+			raft.applyCh <- &ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: int(entry.Index),
 			}
 		}
 
-		// 更新 lastApplied
+		// 更新已应用索引
 		raft.mu.Lock()
+		// 确保 lastApplied 不会超过当前的 commitIndex
+		oldLastApplied := raft.lastApplied
 		raft.lastApplied = max(raft.lastApplied, commitIndex)
+		if raft.lastApplied > oldLastApplied {
+			log.Printf("Node %s updated lastApplied from %d to %d", raft.nodeID, oldLastApplied, raft.lastApplied)
+		}
 		raft.mu.Unlock()
 	}
 }
+
+// encodeState 将 Raft 的状态序列化为字节数组
+// 用于持久化存储
+func (raft *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	// 序列化当前任期
+	e.Encode(raft.currentTerm)
+	// 序列化投票给的节点 ID
+	e.Encode(raft.votedFor)
+	// 序列化日志条目
+	e.Encode(raft.logMgr.entries)
+	// 序列化快照的最后索引
+	e.Encode(raft.logMgr.lastIncludedIndex)
+	// 序列化快照的最后任期
+	e.Encode(raft.logMgr.lastIncludedTerm)
+	return w.Bytes()
+}
+
+// decodeState 将字节数组反序列化为 Raft 的状态
+// 用于从持久化存储中恢复状态
+func (raft *Raft) decodeState(data []byte) {
+	// 如果数据为空，直接返回
+	if len(data) == 0 {
+		return
+	}
+
+	// 初始化解码器
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	// 声明需要反序列化的变量
+	var term int64
+	var votedFor string
+	var entries []LogEntry
+	var lastIndex int64
+	var lastTerm int64
+
+	// 尝试反序列化所有字段
+	if d.Decode(&term) == nil && d.Decode(&votedFor) == nil &&
+		d.Decode(&entries) == nil && d.Decode(&lastIndex) == nil && d.Decode(&lastTerm) == nil {
+		// 反序列化成功，更新状态
+		raft.currentTerm = term
+		raft.votedFor = votedFor
+		raft.logMgr.entries = entries
+		raft.logMgr.lastIncludedIndex = lastIndex
+		raft.logMgr.lastIncludedTerm = lastTerm
+	}
+}
+
+// resetElectionTimer 重置选举计时器
+// 为计时器设置一个新的随机超时时间（1-2秒）
+func (raft *Raft) resetElectionTimer() {
+	// 尝试停止计时器
+	if !raft.electionTimer.Stop() {
+		// 如果计时器已经触发，尝试消费通道中的值
+		select {
+		case <-raft.electionTimer.C:
+		default:
+		}
+	}
+	// 重置计时器，设置一个新的随机超时时间（1-2秒）
+	raft.electionTimer.Reset(tools.RandDuration(1000, 2000))
+}
+
+// killed 检查节点是否已关闭
+// 目前总是返回 false，预留接口用于后续扩展
+func (raft *Raft) killed() bool { return false }

@@ -4,6 +4,7 @@ import "github.com/spf13/viper"
 
 type NodeConfig struct {
 	NodeID string `yaml:"node_id"`
+	Addr   string `yaml:"addr"`
 	Peers  []Node `yaml:"peers"`
 }
 
@@ -12,9 +13,9 @@ type Node struct {
 	Addr string `yaml:"addr"`
 }
 
-func NewNodeConfig() *NodeConfig {
+func NewNodeConfig(configPath string) *NodeConfig {
 	conf := new(NodeConfig)
-	viper.SetConfigFile("./config/node.yaml")
+	viper.SetConfigFile(configPath)
 	err := viper.ReadInConfig()
 	if err != nil {
 		panic("config file read error: " + err.Error())

@@ -7,13 +7,13 @@ option go_package = "./pb";
 
 // Raft 内部核心通讯
 service RaftInternal {
-  // 1. 选主请求：Candidate 发起拉票
+  // 选主请求：Candidate发起拉票
   rpc RequestVote (RequestVoteArgs) returns (RequestVoteReply);
 
-  // 2. 日志同步/心跳：Leader 向其他节点同步日志或维持心跳
+  // 日志同步/心跳：Leader向其他节点同步日志或维持心跳
   rpc AppendEntries (AppendEntriesArgs) returns (AppendEntriesReply);
 
-  // 3. (可选/进阶) 安装快照：当某个节点落后太多时，Leader 直接发快照文件
+  // 安装快照 当某个节点落后太多时，Leader 直接发快照文件
   rpc InstallSnapshot (InstallSnapshotArgs) returns (InstallSnapshotReply);
 }
 
