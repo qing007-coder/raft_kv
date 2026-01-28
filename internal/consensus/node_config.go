@@ -3,14 +3,15 @@ package consensus
 import "github.com/spf13/viper"
 
 type NodeConfig struct {
-	NodeID string `yaml:"node_id"`
-	Addr   string `yaml:"addr"`
-	Peers  []Node `yaml:"peers"`
+	NodeID  string `mapstructure:"node_id"`
+	Addr    string `mapstructure:"addr"`
+	DataDir string `mapstructure:"data_dir"`
+	Peers   []Node `mapstructure:"peers"`
 }
 
 type Node struct {
-	ID   string `yaml:"id"`
-	Addr string `yaml:"addr"`
+	ID   string `mapstructure:"id"`
+	Addr string `mapstructure:"addr"`
 }
 
 func NewNodeConfig(configPath string) *NodeConfig {

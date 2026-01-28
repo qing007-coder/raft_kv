@@ -18,14 +18,14 @@ import (
 
 // Raft 实现了 Raft 共识算法的核心逻辑
 type Raft struct {
-	mu         sync.RWMutex            // 保护并发访问的锁
-	ctx        context.Context         // 上下文，用于控制协程生命周期
-	peersConn  []pb.RaftInternalClient // 与其他节点的 gRPC 连接
-	peers      []Node                  // 集群中其他节点的信息
-	nodeID     string                  // 当前节点的 ID
-	dead       int32                   // 节点是否已关闭的标志
-	grpcServer *grpc.Server            // gRPC 服务器实例
-	addr       string                  // 当前节点的 gRPC 地址
+	mu         sync.RWMutex                     // 保护并发访问的锁
+	ctx        context.Context                  // 上下文，用于控制协程生命周期
+	peersConn  map[string]pb.RaftInternalClient // 与其他节点的 gRPC 连接
+	peers      []Node                           // 集群中其他节点的信息
+	nodeID     string                           // 当前节点的 ID
+	dead       int32                            // 节点是否已关闭的标志
+	grpcServer *grpc.Server                     // gRPC 服务器实例
+	addr       string                           // 当前节点的 gRPC 地址
 	pb.UnimplementedRaftInternalServer
 
 	// 持久化状态 - 这些字段会被保存到磁盘
@@ -54,19 +54,21 @@ type Raft struct {
 	messageChan map[string]chan struct{} // 向每个节点发送复制消息的通道
 	nextIndex   map[string]int64         // 每个节点下一个需要复制的日志索引
 	matchIndex  map[string]int64         // 每个节点已复制的最高日志索引
+	proposalMap map[int64]chan *ApplyMsg // 日志索引 -> 结果 channel，用于等待命令提交
 }
 
 // NewRaft 创建一个新的 Raft 节点
-// basePath: 持久化存储的基础路径
 // applyCh: 应用日志到状态机的通道
 // configPath: 配置文件路径
-func NewRaft(basePath string, applyCh chan *ApplyMsg, configPath string) *Raft {
+func NewRaft(applyCh chan *ApplyMsg, configPath string) *Raft {
 	raft := new(Raft)
 	conf := NewNodeConfig(configPath) // 获取节点配置
 	raft.peers = conf.Peers
+	raft.peersConn = make(map[string]pb.RaftInternalClient)
 	raft.nodeID = conf.NodeID
 	raft.addr = conf.Addr
-	raft.persister = NewPersister(basePath)
+	fmt.Println(conf.DataDir)
+	raft.persister = NewPersister(conf.DataDir)
 	raft.applyCh = applyCh
 	raft.logMgr = NewLogManager()
 
@@ -80,7 +82,8 @@ func NewRaft(basePath string, applyCh chan *ApplyMsg, configPath string) *Raft {
 			continue
 		}
 		client := pb.NewRaftInternalClient(conn)
-		raft.peersConn = append(raft.peersConn, client)
+
+		raft.peersConn[peer.ID] = client
 		raft.messageChan[peer.ID] = make(chan struct{}, 1)
 	}
 
@@ -107,6 +110,7 @@ func NewRaft(basePath string, applyCh chan *ApplyMsg, configPath string) *Raft {
 	raft.votesReceived = make(map[string]bool)
 	raft.nextIndex = make(map[string]int64)
 	raft.matchIndex = make(map[string]int64)
+	raft.proposalMap = make(map[int64]chan *ApplyMsg)
 
 	// 启动 gRPC 服务器
 	raft.grpcServer = grpc.NewServer()
@@ -209,6 +213,50 @@ func (raft *Raft) Propose(command []byte) (index int64, term int64, isLeader boo
 	return newIndex, currentTerm, true
 }
 
+// ProposeWithCallback 向 Raft 集群提交一个命令，并在命令提交后通过 channel 返回结果
+// 只有 Leader 节点可以处理提议
+// 返回值：日志索引、当前任期、是否为 Leader
+func (raft *Raft) ProposeWithCallback(command []byte, resultCh chan *ApplyMsg) (index int64, term int64, isLeader bool) {
+	raft.mu.Lock()
+	defer raft.mu.Unlock()
+
+	// 只有 Leader 可以处理提议
+	if raft.role != Leader {
+		return -1, -1, false
+	}
+
+	// 计算新日志的索引
+	lastIndex, _ := raft.logMgr.GetLastLogInfo()
+	newIndex := lastIndex + 1
+	currentTerm := raft.currentTerm
+
+	// 创建新的日志条目
+	newEntry := &pb.LogEntry{
+		Index: newIndex,
+		Term:  currentTerm,
+		Data:  command,
+	}
+
+	// 将新日志追加到日志管理器
+	raft.logMgr.Append([]*pb.LogEntry{newEntry})
+	// 写入新日志后立即持久化，确保崩溃后可以恢复
+	raft.persist()
+
+	// 记录请求上下文，将日志索引与结果 channel 关联
+	raft.proposalMap[newIndex] = resultCh
+
+	// 通知所有 Follower 节点复制新日志
+	for peerID := range raft.messageChan {
+		select {
+		case raft.messageChan[peerID] <- struct{}{}:
+		default:
+			// 如果通道已满，跳过通知，等待下一次心跳
+		}
+	}
+
+	return newIndex, currentTerm, true
+}
+
 // startElection 开始新一轮选举
 // 当选举超时或接收到更高任期的请求时调用
 func (raft *Raft) startElection() {
@@ -252,7 +300,6 @@ func (raft *Raft) startElection() {
 // 统计投票结果，决定是否成为 Leader
 func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 	raft.mu.Lock()
-	defer raft.mu.Unlock()
 
 	// 如果收到更高任期的回复，更新自己的任期并转为 Follower
 	if resp.Term > raft.currentTerm {
@@ -264,11 +311,13 @@ func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 		raft.persist()
 		// 重置选举计时器
 		raft.resetElectionTimer()
+		raft.mu.Unlock()
 		return
 	}
 
 	// 如果当前不是 Candidate，或者回复的任期小于当前任期，忽略该回复
 	if raft.role != Candidate || resp.Term < raft.currentTerm {
+		raft.mu.Unlock()
 		return
 	}
 
@@ -288,6 +337,7 @@ func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 	totalNodes := len(raft.peersConn) + 1
 	log.Printf("Node %s has received %d votes out of %d needed for term %d", raft.nodeID, grantedCount, (totalNodes/2)+1, raft.currentTerm)
 
+	raft.mu.Unlock()
 	// 如果获得超过半数的赞成票，成为 Leader
 	if grantedCount > totalNodes/2 {
 		raft.becomeLeader()
@@ -297,6 +347,8 @@ func (raft *Raft) handleResponse(resp *pb.RequestVoteReply) {
 // becomeLeader 转换为 Leader 状态
 // 当获得超过半数的投票时调用
 func (raft *Raft) becomeLeader() {
+	raft.mu.Lock()
+
 	// 转换为 Leader 状态
 	raft.role = Leader
 	// 停止选举计时器，因为 Leader 不需要选举
@@ -305,12 +357,16 @@ func (raft *Raft) becomeLeader() {
 	// 获取当前最后一条日志的索引
 	lastLogIndex, _ := raft.logMgr.GetLastLogInfo()
 
+	raft.mu.Unlock()
 	// 初始化每个 Follower 的 nextIndex 和 matchIndex
 	for _, peer := range raft.peers {
+		raft.mu.Lock()
 		// nextIndex 初始化为最后一条日志的下一个位置
 		raft.nextIndex[peer.ID] = lastLogIndex + 1
 		// matchIndex 初始化为 0
 		raft.matchIndex[peer.ID] = 0
+		raft.mu.Unlock()
+
 		// 为每个 Follower 启动一个复制协程
 		go raft.Replicator(peer.ID)
 	}
@@ -349,13 +405,7 @@ func (raft *Raft) sendHeartbeat() {
 // 负责将日志复制到指定的 Follower 节点
 func (raft *Raft) Replicator(peerID string) {
 	// 找到目标节点的 gRPC 客户端
-	var targetClient pb.RaftInternalClient
-	for i, p := range raft.peers {
-		if p.ID == peerID {
-			targetClient = raft.peersConn[i]
-			break
-		}
-	}
+	targetClient := raft.peersConn[peerID]
 
 	// 只要节点未关闭且仍是 Leader，就持续复制日志
 	for !raft.killed() {
@@ -878,11 +928,29 @@ func (raft *Raft) applyLoop() {
 
 		// 将日志条目应用到状态机
 		for _, entry := range entries {
-			raft.applyCh <- &ApplyMsg{
+			applyMsg := &ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: int(entry.Index),
 			}
+			raft.applyCh <- applyMsg
+
+			// 检查是否有等待该日志索引的结果 channel
+			raft.mu.Lock()
+			if resultCh, exists := raft.proposalMap[entry.Index]; exists {
+				// 发送结果到 channel
+				select {
+				case resultCh <- applyMsg:
+					// 成功发送结果
+					log.Printf("Node %s sent result for log index %d to proposal channel", raft.nodeID, entry.Index)
+				default:
+					// channel 已满或已关闭，记录错误
+					log.Printf("Node %s failed to send result for log index %d: channel full or closed", raft.nodeID, entry.Index)
+				}
+				// 删除映射，避免内存泄漏
+				delete(raft.proposalMap, entry.Index)
+			}
+			raft.mu.Unlock()
 		}
 
 		// 更新已应用索引
