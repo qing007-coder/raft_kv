@@ -101,8 +101,11 @@ raft_kv/
 ## 7. 成功场景截图
 
 
-### 节点启动成功 Leader选举成功 写入操作成功
-![成功场景](docs/correct_result.png)
+### 节点启动成功 Leader选举成功 写入操作成功(非leader)
+![成功场景](docs/correct_result(follower).png)
+
+### 节点启动成功 Leader选举成功 写入操作成功(leader)
+![成功场景](docs/correct_result(leader).png)
 
 ## 8. 失败场景截图
 
