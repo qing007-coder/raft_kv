@@ -22,7 +22,7 @@ Raft KV 是一个基于 Raft 共识算法的分布式键值存储系统，支持
 | 持久化存储 | 数据持久化 |
 
 ## 3. 系统架构
-![系统架构图](docs/architecture.png)
+![系统架构图](docs/architecture_.png)
 
 ### 核心组件
 - **Server**：HTTP 服务器，处理客户端请求，通过 Raft 提交写入命令
