@@ -2,7 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"time"
+
+	"raft_kv/internal/consensus"
 )
 
 func (s *Server) registerRoutes() {
@@ -37,14 +41,41 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Put(req.Key, []byte(req.Value)); err != nil {
-		http.Error(w, "put failed", http.StatusInternalServerError)
+	// 构造命令
+	cmd := struct {
+		Op    string `json:"op"`
+		Key   string `json:"key"`
+		Value []byte `json:"value"`
+	}{
+		Op:    "put",
+		Key:   req.Key,
+		Value: []byte(req.Value),
+	}
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		http.Error(w, "failed to marshal command", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(PutResp{OK: true})
+	// 通过 Raft 提交命令
+	resultCh := make(chan *consensus.ApplyMsg, 1)
+	_, _, isLeader := s.raft.ProposeWithCallback(cmdBytes, resultCh)
+	if !isLeader {
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 等待命令提交
+	select {
+	case <-resultCh:
+		// 命令已提交并应用
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(PutResp{OK: true})
+	case <-time.After(3 * time.Second):
+		http.Error(w, "timeout waiting for command to be committed", http.StatusRequestTimeout)
+		return
+	}
 }
 
 // GET /kv?key=xxx
@@ -55,11 +86,15 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Println("key:", key)
+
 	value, ok := s.store.Get(key)
 	if !ok {
 		http.Error(w, "key not found", http.StatusNotFound)
 		return
 	}
+
+	fmt.Println("value:", value)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(GetResp{
@@ -76,11 +111,37 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Delete(key); err != nil {
-		http.Error(w, "delete failed", http.StatusInternalServerError)
+	// 构造命令
+	cmd := struct {
+		Op  string `json:"op"`
+		Key string `json:"key"`
+	}{
+		Op:  "delete",
+		Key: key,
+	}
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		http.Error(w, "failed to marshal command", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(DeleteResp{OK: true})
+	// 通过 Raft 提交命令
+	resultCh := make(chan *consensus.ApplyMsg, 1)
+	_, _, isLeader := s.raft.ProposeWithCallback(cmdBytes, resultCh)
+	if !isLeader {
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 等待命令提交
+	select {
+	case <-resultCh:
+		// 命令已提交并应用
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(DeleteResp{OK: true})
+	case <-time.After(3 * time.Second):
+		http.Error(w, "timeout waiting for command to be committed", http.StatusRequestTimeout)
+		return
+	}
 }
