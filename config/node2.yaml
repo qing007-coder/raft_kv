@@ -1,0 +1,8 @@
+node_id: 2
+addr: 127.0.0.1:54189
+data_dir: ./data/node2
+peers:
+  - id: 1
+    addr: 127.0.0.1:54188
+  - id: 3
+    addr: 127.0.0.1:54190

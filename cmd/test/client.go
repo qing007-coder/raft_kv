@@ -6,7 +6,7 @@ import (
 )
 
 func main() {
-	client := test.NewClient("http://localhost:8080/kv")
+	client := test.NewClient("http://localhost:8081/kv")
 	client.Put("server_name", "gateway")
 
 	data := client.Get("server_name")
