@@ -146,7 +146,6 @@ func (raft *Raft) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotAr
     
     // 应用快照数据到状态机
     raft.applySnapshot(req.Data)
-    
     return &pb.InstallSnapshotReply{Term: raft.currentTerm}, nil
 }
 ```
